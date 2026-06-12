@@ -1,0 +1,151 @@
+//kage:unit pixels
+
+package main
+
+// Slug curve-coverage algorithm (Eric Lengyel), in Kage with a nonzero fill
+// rule. Reference: github.com/EricLengyel/Slug.
+//
+// Control points come from a data texture (image 0). Ebiten images are RGBA8, so
+// each point is two 16-bit fixed-point values (x in R,G; y in B,A) over the
+// per-font range [CurveBias, CurveBias + 0xffff*CurveScale] per axis, decoded in
+// fetch.
+//
+// Quad dilation is a fixed CPU margin (see font.go) instead of the reference's
+// per-vertex dilation, which needs a vertex stage Kage lacks.
+
+// maxLoop bounds the per-glyph curve loop. A glyph with more curves truncates.
+const maxLoop = 4096
+
+// TexWidth is the curve texture width. CurveBias/CurveScale decode the
+// fixed-point control points. OpticalWeight applies the SLUG_WEIGHT boost when
+// nonzero. Per glyph, CurveStart/CurveCount ride in custom.z/custom.w and the
+// color in the vertex color, so one draw can mix glyphs and colors.
+var TexWidth float
+var CurveBias vec2
+var CurveScale vec2
+var OpticalWeight int
+
+// fetch reads control point idx (three per curve) and decodes it to em units.
+func fetch(idx float) vec2 {
+	ty := floor(idx / TexWidth)
+	tx := idx - ty*TexWidth
+	c := imageSrc0UnsafeAt(imageSrc0Origin() + vec2(tx, ty) + vec2(0.5))
+	x := floor(c.r*255.0+0.5)*256.0 + floor(c.g*255.0+0.5)
+	y := floor(c.b*255.0+0.5)*256.0 + floor(c.a*255.0+0.5)
+	return CurveBias + vec2(x, y)*CurveScale
+}
+
+// rootCode returns Slug's root-eligibility code for a quadratic, from its three
+// control-point coordinates on the ray's perpendicular axis. Bit 0 marks the
+// first root eligible, bit 8 the second.
+func rootCode(c1 float, c2 float, c3 float) int {
+	shift := 0
+	if c1 < 0.0 {
+		shift += 1
+	}
+	if c2 < 0.0 {
+		shift += 2
+	}
+	if c3 < 0.0 {
+		shift += 4
+	}
+	return (0x2E74 >> shift) & 0x0101
+}
+
+// solveHoriz returns the x coordinates where the curve crosses y = 0, at the
+// two roots t1 = (b-d)/a and t2 = (b+d)/a. Control points are relative to the
+// sample point. Near-linear curves fall back to the single root b/a.
+func solveHoriz(p1 vec2, p2 vec2, p3 vec2) vec2 {
+	a := p1 - 2.0*p2 + p3
+	b := p1 - p2
+	ra := 1.0 / a.y
+	rb := 0.5 / b.y
+	d := sqrt(max(b.y*b.y-a.y*p1.y, 0.0))
+	t1 := (b.y - d) * ra
+	t2 := (b.y + d) * ra
+	if abs(a.y) < 1.0/65536.0 {
+		t1 = p1.y * rb
+		t2 = t1
+	}
+	return vec2((a.x*t1-b.x*2.0)*t1+p1.x, (a.x*t2-b.x*2.0)*t2+p1.x)
+}
+
+// solveVert returns the y coordinates where the curve crosses x = 0.
+func solveVert(p1 vec2, p2 vec2, p3 vec2) vec2 {
+	a := p1 - 2.0*p2 + p3
+	b := p1 - p2
+	ra := 1.0 / a.x
+	rb := 0.5 / b.x
+	d := sqrt(max(b.x*b.x-a.x*p1.x, 0.0))
+	t1 := (b.x - d) * ra
+	t2 := (b.x + d) * ra
+	if abs(a.x) < 1.0/65536.0 {
+		t1 = p1.x * rb
+		t2 = t1
+	}
+	return vec2((a.y*t1-b.y*2.0)*t1+p1.y, (a.y*t2-b.y*2.0)*t2+p1.y)
+}
+
+func Fragment(dstPos vec4, srcPos vec2, color vec4, custom vec4) vec4 {
+	rc := custom.xy
+	// custom.z/w are the glyph's curve slice, constant across the quad.
+	curveStart := custom.z
+	curveCount := custom.w
+
+	// Pixels per em, per axis, from screen-space derivatives.
+	pixelsPerEm := vec2(1.0) / max(fwidth(rc), vec2(1.0/65536.0))
+
+	xcov := 0.0
+	xwgt := 0.0
+	ycov := 0.0
+	ywgt := 0.0
+
+	for i := 0; i < maxLoop; i++ {
+		if float(i) >= curveCount {
+			break
+		}
+		base := (curveStart + float(i)) * 3.0
+		p1 := fetch(base) - rc
+		p2 := fetch(base+1.0) - rc
+		p3 := fetch(base+2.0) - rc
+
+		// Horizontal ray: crossings of y = 0.
+		hcode := rootCode(p1.y, p2.y, p3.y)
+		if hcode != 0 {
+			r := solveHoriz(p1, p2, p3) * pixelsPerEm.x
+			if (hcode & 1) != 0 {
+				xcov += clamp(r.x+0.5, 0.0, 1.0)
+				xwgt = max(xwgt, clamp(1.0-abs(r.x)*2.0, 0.0, 1.0))
+			}
+			if hcode > 1 {
+				xcov -= clamp(r.y+0.5, 0.0, 1.0)
+				xwgt = max(xwgt, clamp(1.0-abs(r.y)*2.0, 0.0, 1.0))
+			}
+		}
+
+		// Vertical ray: crossings of x = 0.
+		vcode := rootCode(p1.x, p2.x, p3.x)
+		if vcode != 0 {
+			r := solveVert(p1, p2, p3) * pixelsPerEm.y
+			if (vcode & 1) != 0 {
+				ycov -= clamp(r.x+0.5, 0.0, 1.0)
+				ywgt = max(ywgt, clamp(1.0-abs(r.x)*2.0, 0.0, 1.0))
+			}
+			if vcode > 1 {
+				ycov += clamp(r.y+0.5, 0.0, 1.0)
+				ywgt = max(ywgt, clamp(1.0-abs(r.y)*2.0, 0.0, 1.0))
+			}
+		}
+	}
+
+	// Combine the rays, weighted by how close crossings fall to the pixel center;
+	// fall back to winding agreement inside the glyph.
+	cov := max(abs(xcov*xwgt+ycov*ywgt)/max(xwgt+ywgt, 1.0/65536.0), min(abs(xcov), abs(ycov)))
+	cov = clamp(cov, 0.0, 1.0)
+
+	// Reference SLUG_WEIGHT: a sqrt boosts the optical weight of thin strokes.
+	if OpticalWeight != 0 {
+		cov = sqrt(cov)
+	}
+	return color * cov
+}
